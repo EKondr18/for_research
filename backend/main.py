@@ -1,3 +1,4 @@
+import gc
 import logging
 
 from fastapi import FastAPI, Header, HTTPException
@@ -120,6 +121,8 @@ def reindex(x_reindex_token: str | None = Header(default=None)):
             # the same unreadable file on every /reindex call.
             store.delete_chunks_for_file(f.id)
             store.upsert_file_meta(f.id, f.name, f.modified_time)
+            del pdf_bytes, pages
+            gc.collect()
             continue
 
         chunks = chunk_pages(pages, settings.chunk_size, settings.chunk_overlap)
@@ -132,6 +135,13 @@ def reindex(x_reindex_token: str | None = Header(default=None)):
 
         processed.append({"file": f.name, "chunks": len(chunks)})
         logger.info("Проиндексирован файл '%s': %d чанков", f.name, len(chunks))
+
+        # Free per-file memory before the next iteration -- Render's free
+        # tier caps this service at 512MB, and PDF bytes / chunk texts /
+        # vectors for a large file can add up to tens of MB that don't need
+        # to stick around once the file is upserted to Qdrant.
+        del pdf_bytes, pages, chunks, texts, vectors
+        gc.collect()
 
     return {
         "total_files_in_drive": len(remote_files),
