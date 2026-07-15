@@ -1,58 +1,102 @@
-"""Embedding generation via fastembed (ONNX runtime, no torch dependency).
+"""Embedding generation via the Hugging Face Inference API (hosted, remote).
 
-We use fastembed instead of plain sentence-transformers because
-sentence-transformers pulls in PyTorch, which alone is commonly 500MB-1GB+ of
-RAM/disk -- risky on Render's free tier (512MB-1GB RAM). fastembed runs the
-same underlying sentence-transformers models through ONNX Runtime with a much
-smaller footprint (this model is ~0.22GB), which is a better fit for a
-free-tier deployment.
+A local ONNX model (fastembed) was tried first, but even the smallest
+available multilingual model doesn't fit in Render's free-tier 512MB RAM
+once combined with the rest of the app (FastAPI, Qdrant client, Groq client,
+ONNX Runtime, and the loaded model itself) -- the service OOM'd loading the
+model, before ever touching a document. Calling a hosted model instead means
+no ML runtime/model lives in this process at all, which is what actually
+keeps memory usage low enough for the free tier.
 
 Model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-(384-dim, multilingual incl. Russian). Unlike E5-family models, this one does
-not require "query: "/"passage: " prefixes on the input text.
+(384-dim, multilingual incl. Russian) -- same model as before, now hosted on
+HF's infrastructure instead of loaded locally.
 
-Render's free tier caps a service at 512MB RAM, which is tight for any ONNX
-model. To stay under that: the ONNX Runtime session is limited to a single
-thread (avoids per-thread buffer duplication) and embed() calls use a small
-batch_size instead of fastembed's default of 256 (avoids holding a large
-batch's tokenized/output tensors in memory at once for files with many
-chunks).
+Trade-offs vs a local model:
+- Adds network latency per request/reindex.
+- HF's free serverless tier "cold starts": if the model hasn't been called
+  recently, the first request can return 503 while HF loads it on their
+  side -- handled here with a bounded retry/wait loop.
+- Free tier is rate-limited (roughly a few hundred requests/hour) -- fine
+  for a personal/small-team tool, not for heavy traffic.
 """
 import logging
+import time
 
-from fastembed import TextEmbedding
+import requests
 
 logger = logging.getLogger("embeddings")
 
-_EMBED_BATCH_SIZE = 16
-
-_model: TextEmbedding | None = None
-_model_name: str | None = None
-
-
-def _get_model(model_name: str) -> TextEmbedding:
-    global _model, _model_name
-    if _model is None or _model_name != model_name:
-        logger.info("Загрузка embedding-модели '%s'...", model_name)
-        _model = TextEmbedding(model_name=model_name, threads=1)
-        _model_name = model_name
-        logger.info("Embedding-модель загружена")
-    return _model
+HF_ROUTER_BASE = "https://router.huggingface.co/hf-inference/models"
+EMBEDDING_DIM = 384  # sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+_BATCH_SIZE = 16
+_MAX_COLD_START_WAIT_S = 90
 
 
-def embed_passages(texts: list[str], model_name: str) -> list[list[float]]:
+class EmbeddingAPIError(RuntimeError):
+    pass
+
+
+def _post_with_cold_start_retry(url: str, headers: dict, payload: dict) -> requests.Response:
+    deadline = time.monotonic() + _MAX_COLD_START_WAIT_S
+    while True:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        if resp.status_code == 503:
+            wait_s = 5.0
+            try:
+                wait_s = min(float(resp.json().get("estimated_time", 5.0)), 20.0)
+            except (ValueError, TypeError):
+                pass
+            if time.monotonic() + wait_s > deadline:
+                return resp
+            logger.info("HF-модель ещё прогревается (cold start), жду %.0fs...", wait_s)
+            time.sleep(wait_s)
+            continue
+        return resp
+
+
+def _pool_if_needed(item: list) -> list[float]:
+    # sentence-transformers models normally return one already-pooled vector
+    # per input (a flat list of floats). Some deployments instead return
+    # token-level vectors (a list of per-token vectors) -- mean-pool those.
+    if item and isinstance(item[0], list):
+        dim = len(item[0])
+        sums = [0.0] * dim
+        for token_vec in item:
+            for i, v in enumerate(token_vec):
+                sums[i] += v
+        return [s / len(item) for s in sums]
+    return item
+
+
+def _embed_batch(texts: list[str], model_name: str, hf_token: str) -> list[list[float]]:
+    url = f"{HF_ROUTER_BASE}/{model_name}/pipeline/feature-extraction"
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    resp = _post_with_cold_start_retry(url, headers, {"inputs": texts})
+
+    if resp.status_code != 200:
+        raise EmbeddingAPIError(
+            f"Hugging Face Inference API вернул ошибку {resp.status_code} для модели "
+            f"'{model_name}': {resp.text[:500]}"
+        )
+
+    data = resp.json()
+    return [_pool_if_needed(item) for item in data]
+
+
+def embed_passages(texts: list[str], model_name: str, hf_token: str) -> list[list[float]]:
     if not texts:
         return []
-    model = _get_model(model_name)
-    return [v.tolist() for v in model.embed(texts, batch_size=_EMBED_BATCH_SIZE)]
+    vectors: list[list[float]] = []
+    for i in range(0, len(texts), _BATCH_SIZE):
+        batch = texts[i : i + _BATCH_SIZE]
+        vectors.extend(_embed_batch(batch, model_name, hf_token))
+    return vectors
 
 
-def embed_query(text: str, model_name: str) -> list[float]:
-    model = _get_model(model_name)
-    vectors = list(model.embed([text], batch_size=_EMBED_BATCH_SIZE))
-    return vectors[0].tolist()
+def embed_query(text: str, model_name: str, hf_token: str) -> list[float]:
+    return _embed_batch([text], model_name, hf_token)[0]
 
 
 def get_embedding_dim(model_name: str) -> int:
-    model = _get_model(model_name)
-    return list(model.embed(["dimension probe"], batch_size=_EMBED_BATCH_SIZE))[0].shape[0]
+    return EMBEDDING_DIM

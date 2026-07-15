@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from config import MissingConfigError, settings
 from drive import DriveAccessError, DriveClient
-from embeddings import embed_passages, embed_query, get_embedding_dim
+from embeddings import EmbeddingAPIError, embed_passages, embed_query, get_embedding_dim
 from llm import GroqProvider
 from pdf_processing import chunk_pages, extract_pages_text
 from qdrant_store import QdrantStore
@@ -74,6 +74,16 @@ def health():
     except Exception as e:
         status["groq"] = f"error: {e}"
 
+    try:
+        embed_query("healthcheck", settings.embedding_model, settings.hf_api_token)
+        status["huggingface_embeddings"] = "ok"
+    except MissingConfigError as e:
+        status["huggingface_embeddings"] = f"error: {e}"
+    except EmbeddingAPIError as e:
+        status["huggingface_embeddings"] = f"error: {e}"
+    except Exception as e:
+        status["huggingface_embeddings"] = f"error: {e}"
+
     overall_ok = all(v == "ok" for v in status.values())
     return {"status": "ok" if overall_ok else "degraded", "services": status}
 
@@ -127,7 +137,14 @@ def reindex(x_reindex_token: str | None = Header(default=None)):
 
         chunks = chunk_pages(pages, settings.chunk_size, settings.chunk_overlap)
         texts = [c.text for c in chunks]
-        vectors = embed_passages(texts, settings.embedding_model)
+        try:
+            vectors = embed_passages(texts, settings.embedding_model, settings.hf_api_token)
+        except EmbeddingAPIError as e:
+            logger.error("Пропуск файла '%s': %s", f.name, e)
+            errors.append({"file": f.name, "error": str(e)})
+            del pdf_bytes, pages, chunks, texts
+            gc.collect()
+            continue
 
         store.delete_chunks_for_file(f.id)
         store.upsert_chunks(f.id, f.name, [(c.text, c.page) for c in chunks], vectors)
@@ -179,10 +196,12 @@ def ask(req: AskRequest):
 
     try:
         store = get_qdrant_store()
-        query_vector = embed_query(question, settings.embedding_model)
+        query_vector = embed_query(question, settings.embedding_model, settings.hf_api_token)
         hits = store.search(query_vector, settings.search_top_k)
     except MissingConfigError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except EmbeddingAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
     if not hits:
         return AskResponse(

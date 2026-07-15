@@ -4,6 +4,5 @@ pydantic>=2.7,<3.0
 requests>=2.31,<3.0
 pypdf>=4.2,<6.0
 langchain-text-splitters>=0.2,<0.4
-fastembed>=0.4,<1.0
 qdrant-client>=1.9,<2.0
 groq>=0.9,<1.0

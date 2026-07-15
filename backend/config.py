@@ -63,6 +63,13 @@ class Settings:
         )
 
     @property
+    def hf_api_token(self) -> str:
+        # Токен Hugging Face (Settings -> Access Tokens, права Read
+        # достаточно) -- нужен для вызова HF Inference API, которым
+        # считаются эмбеддинги (см. embeddings.py).
+        return _require("HF_API_TOKEN")
+
+    @property
     def chunks_collection(self) -> str:
         return os.environ.get("QDRANT_CHUNKS_COLLECTION", "pdf_chunks")
 
