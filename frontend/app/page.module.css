@@ -1,0 +1,147 @@
+.main {
+  display: flex;
+  justify-content: center;
+  padding: 48px 16px;
+  flex: 1;
+}
+
+.container {
+  width: 100%;
+  max-width: 720px;
+}
+
+.title {
+  font-size: 28px;
+  margin-bottom: 8px;
+}
+
+.subtitle {
+  color: #666;
+  margin-bottom: 24px;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  .subtitle {
+    color: #a0a0a0;
+  }
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.textarea {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 16px;
+  font-family: inherit;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+  resize: vertical;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.textarea:focus {
+  outline: 2px solid #4f7cff;
+  outline-offset: -1px;
+}
+
+.button {
+  align-self: flex-start;
+  padding: 10px 20px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #fff;
+  background: #4f46e5;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.button:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+.error {
+  margin-top: 20px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #fee2e2;
+  color: #991b1b;
+  line-height: 1.4;
+}
+
+@media (prefers-color-scheme: dark) {
+  .error {
+    background: #3f1d1d;
+    color: #fca5a5;
+  }
+}
+
+.result {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 1px solid #e5e7eb;
+}
+
+@media (prefers-color-scheme: dark) {
+  .result {
+    border-top-color: #333;
+  }
+}
+
+.answerHeading {
+  font-size: 18px;
+  margin-bottom: 8px;
+}
+
+.answerText {
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.sourcesHeading {
+  font-size: 15px;
+  margin-top: 24px;
+  margin-bottom: 8px;
+  color: #666;
+}
+
+@media (prefers-color-scheme: dark) {
+  .sourcesHeading {
+    color: #a0a0a0;
+  }
+}
+
+.sourcesList {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sourceItem a {
+  color: #4f46e5;
+  text-decoration: underline;
+}
+
+@media (prefers-color-scheme: dark) {
+  .sourceItem a {
+    color: #818cf8;
+  }
+}
+
+.sourcePage {
+  color: #666;
+}
+
+@media (prefers-color-scheme: dark) {
+  .sourcePage {
+    color: #a0a0a0;
+  }
+}
