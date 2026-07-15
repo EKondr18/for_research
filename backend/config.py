@@ -24,7 +24,10 @@ class Settings:
 
     @property
     def google_drive_folder_id(self) -> str:
-        return _require("GOOGLE_DRIVE_FOLDER_ID")
+        # Значение по умолчанию — ID папки, расшаренной как "у кого есть
+        # ссылка" для этого проекта. Переопределяется через переменную
+        # окружения GOOGLE_DRIVE_FOLDER_ID, если понадобится другая папка.
+        return os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1-0D0CBJouoD1npQ2VERpHnhdSol4S5Df").strip()
 
     @property
     def qdrant_url(self) -> str:
