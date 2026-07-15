@@ -1,5 +1,7 @@
 import gc
 import logging
+import threading
+import time
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -89,13 +91,33 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# POST /reindex
+# POST /reindex, GET /reindex/status
 # ---------------------------------------------------------------------------
+#
+# Reindexing a couple of large PDFs means thousands of chunks, each requiring
+# its own network round-trip to the HF Inference API -- that easily takes
+# several minutes, well past what Render's (or any) HTTP proxy will hold a
+# single request open for (~100s is a common ceiling before a 502/504 or a
+# dropped connection). So /reindex only *starts* the work in a background
+# thread and returns immediately; progress and the final result are polled
+# via GET /reindex/status instead of waiting on the POST response.
 
-@app.post("/reindex")
-def reindex(x_reindex_token: str | None = Header(default=None)):
-    if settings.reindex_token is not None and x_reindex_token != settings.reindex_token:
-        raise HTTPException(status_code=401, detail="Неверный или отсутствующий X-Reindex-Token")
+_reindex_lock = threading.Lock()
+_reindex_state: dict = {"status": "idle"}  # idle | running | done | error
+
+
+def _run_reindex() -> None:
+    state = {
+        "status": "running",
+        "started_at": time.time(),
+        "total_files_in_drive": 0,
+        "files_to_process": 0,
+        "current_file": None,
+        "processed": [],
+        "skipped_no_text_layer": [],
+        "errors": [],
+    }
+    _reindex_state.update(state)
 
     try:
         drive = DriveClient(settings.google_drive_api_key, settings.google_drive_folder_id)
@@ -104,29 +126,31 @@ def reindex(x_reindex_token: str | None = Header(default=None)):
         store.ensure_collections(embedding_dim)
 
         remote_files = drive.list_pdf_files()
-    except MissingConfigError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except DriveAccessError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        indexed = store.get_indexed_files()
+        to_process = [f for f in remote_files if indexed.get(f.id) != f.modified_time]
 
-    indexed = store.get_indexed_files()
-
-    to_process = [f for f in remote_files if indexed.get(f.id) != f.modified_time]
-    logger.info("К индексации: %d из %d файлов (новые/изменённые)", len(to_process), len(remote_files))
-
-    processed, skipped_no_text, errors = [], [], []
+        _reindex_state["total_files_in_drive"] = len(remote_files)
+        _reindex_state["files_to_process"] = len(to_process)
+        _reindex_state["unchanged_files"] = len(remote_files) - len(to_process)
+        logger.info("К индексации: %d из %d файлов (новые/изменённые)", len(to_process), len(remote_files))
+    except (MissingConfigError, DriveAccessError) as e:
+        _reindex_state["status"] = "error"
+        _reindex_state["errors"].append({"file": None, "error": str(e)})
+        _reindex_state["finished_at"] = time.time()
+        return
 
     for f in to_process:
+        _reindex_state["current_file"] = f.name
         try:
             pdf_bytes = drive.download_file(f.id, f.name)
         except DriveAccessError as e:
             logger.error("Пропуск файла '%s': %s", f.name, e)
-            errors.append({"file": f.name, "error": str(e)})
+            _reindex_state["errors"].append({"file": f.name, "error": str(e)})
             continue
 
         pages = extract_pages_text(pdf_bytes, f.name)
         if not pages:
-            skipped_no_text.append(f.name)
+            _reindex_state["skipped_no_text_layer"].append(f.name)
             # Still record as "indexed" (with no chunks) so we don't retry
             # the same unreadable file on every /reindex call.
             store.delete_chunks_for_file(f.id)
@@ -141,7 +165,7 @@ def reindex(x_reindex_token: str | None = Header(default=None)):
             vectors = embed_passages(texts, settings.embedding_model, settings.hf_api_token)
         except EmbeddingAPIError as e:
             logger.error("Пропуск файла '%s': %s", f.name, e)
-            errors.append({"file": f.name, "error": str(e)})
+            _reindex_state["errors"].append({"file": f.name, "error": str(e)})
             del pdf_bytes, pages, chunks, texts
             gc.collect()
             continue
@@ -150,7 +174,7 @@ def reindex(x_reindex_token: str | None = Header(default=None)):
         store.upsert_chunks(f.id, f.name, [(c.text, c.page) for c in chunks], vectors)
         store.upsert_file_meta(f.id, f.name, f.modified_time)
 
-        processed.append({"file": f.name, "chunks": len(chunks)})
+        _reindex_state["processed"].append({"file": f.name, "chunks": len(chunks)})
         logger.info("Проиндексирован файл '%s': %d чанков", f.name, len(chunks))
 
         # Free per-file memory before the next iteration -- Render's free
@@ -160,13 +184,32 @@ def reindex(x_reindex_token: str | None = Header(default=None)):
         del pdf_bytes, pages, chunks, texts, vectors
         gc.collect()
 
-    return {
-        "total_files_in_drive": len(remote_files),
-        "processed": processed,
-        "skipped_no_text_layer": skipped_no_text,
-        "errors": errors,
-        "unchanged_files": len(remote_files) - len(to_process),
-    }
+    _reindex_state["current_file"] = None
+    _reindex_state["status"] = "done"
+    _reindex_state["finished_at"] = time.time()
+
+
+@app.post("/reindex")
+def reindex(x_reindex_token: str | None = Header(default=None)):
+    if settings.reindex_token is not None and x_reindex_token != settings.reindex_token:
+        raise HTTPException(status_code=401, detail="Неверный или отсутствующий X-Reindex-Token")
+
+    if not _reindex_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Переиндексация уже выполняется, проверьте GET /reindex/status")
+
+    def run():
+        try:
+            _run_reindex()
+        finally:
+            _reindex_lock.release()
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"status": "started", "detail": "Переиндексация запущена в фоне, следите за GET /reindex/status"}
+
+
+@app.get("/reindex/status")
+def reindex_status():
+    return _reindex_state
 
 
 # ---------------------------------------------------------------------------
