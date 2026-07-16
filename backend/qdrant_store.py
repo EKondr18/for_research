@@ -40,6 +40,17 @@ class QdrantStore:
                 vectors_config=qmodels.VectorParams(size=embedding_dim, distance=qmodels.Distance.COSINE),
             )
 
+        # Qdrant requires a payload index on a field before it can be used in
+        # a filter (e.g. delete_chunks_for_file's filter on drive_file_id) --
+        # without this, deleting/filtering by drive_file_id fails with a 400.
+        # Creating an index that already exists is a harmless no-op, so this
+        # runs unconditionally rather than only when the collection is new.
+        self.client.create_payload_index(
+            collection_name=self.chunks_collection,
+            field_name="drive_file_id",
+            field_schema=qmodels.PayloadSchemaType.KEYWORD,
+        )
+
         if self.meta_collection not in existing:
             logger.info("Создаю коллекцию '%s' в Qdrant", self.meta_collection)
             self.client.create_collection(

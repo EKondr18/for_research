@@ -107,6 +107,20 @@ _reindex_state: dict = {"status": "idle"}  # idle | running | done | error
 
 
 def _run_reindex() -> None:
+    # Top-level safety net: whatever happens inside _run_reindex_body, this
+    # guarantees /reindex/status eventually leaves "running" instead of
+    # hanging forever if something unanticipated blows up outside the
+    # per-file loop's own try/except (e.g. a Qdrant connection error).
+    try:
+        _run_reindex_body()
+    except Exception as e:
+        logger.exception("Переиндексация упала с необработанной ошибкой")
+        _reindex_state["status"] = "error"
+        _reindex_state.setdefault("errors", []).append({"file": None, "error": f"{type(e).__name__}: {e}"})
+        _reindex_state["finished_at"] = time.time()
+
+
+def _run_reindex_body() -> None:
     state = {
         "status": "running",
         "started_at": time.time(),
@@ -117,6 +131,7 @@ def _run_reindex() -> None:
         "skipped_no_text_layer": [],
         "errors": [],
     }
+    _reindex_state.clear()
     _reindex_state.update(state)
 
     try:
@@ -141,48 +156,49 @@ def _run_reindex() -> None:
 
     for f in to_process:
         _reindex_state["current_file"] = f.name
+        # Catch absolutely everything per-file (not just the errors we
+        # anticipated) -- an unhandled exception here previously escaped
+        # this loop entirely, crashing the background thread and leaving
+        # /reindex/status stuck on "running" forever with no error recorded.
         try:
             pdf_bytes = drive.download_file(f.id, f.name)
-        except DriveAccessError as e:
-            logger.error("Пропуск файла '%s': %s", f.name, e)
-            _reindex_state["errors"].append({"file": f.name, "error": str(e)})
-            continue
 
-        pages = extract_pages_text(pdf_bytes, f.name)
-        if not pages:
-            _reindex_state["skipped_no_text_layer"].append(f.name)
-            # Still record as "indexed" (with no chunks) so we don't retry
-            # the same unreadable file on every /reindex call.
-            store.delete_chunks_for_file(f.id)
-            store.upsert_file_meta(f.id, f.name, f.modified_time)
-            del pdf_bytes, pages
-            gc.collect()
-            continue
+            pages = extract_pages_text(pdf_bytes, f.name)
+            if not pages:
+                _reindex_state["skipped_no_text_layer"].append(f.name)
+                # Still record as "indexed" (with no chunks) so we don't
+                # retry the same unreadable file on every /reindex call.
+                store.delete_chunks_for_file(f.id)
+                store.upsert_file_meta(f.id, f.name, f.modified_time)
+                del pdf_bytes, pages
+                gc.collect()
+                continue
 
-        chunks = chunk_pages(pages, settings.chunk_size, settings.chunk_overlap)
-        texts = [c.text for c in chunks]
-        try:
+            chunks = chunk_pages(pages, settings.chunk_size, settings.chunk_overlap)
+            texts = [c.text for c in chunks]
             vectors = embed_passages(texts, settings.embedding_model, settings.hf_api_token)
-        except EmbeddingAPIError as e:
+
+            store.delete_chunks_for_file(f.id)
+            store.upsert_chunks(f.id, f.name, [(c.text, c.page) for c in chunks], vectors)
+            store.upsert_file_meta(f.id, f.name, f.modified_time)
+
+            _reindex_state["processed"].append({"file": f.name, "chunks": len(chunks)})
+            logger.info("Проиндексирован файл '%s': %d чанков", f.name, len(chunks))
+
+            # Free per-file memory before the next iteration -- Render's
+            # free tier caps this service at 512MB, and PDF bytes / chunk
+            # texts / vectors for a large file can add up to tens of MB
+            # that don't need to stick around once upserted to Qdrant.
+            del pdf_bytes, pages, chunks, texts, vectors
+            gc.collect()
+        except (DriveAccessError, EmbeddingAPIError) as e:
             logger.error("Пропуск файла '%s': %s", f.name, e)
             _reindex_state["errors"].append({"file": f.name, "error": str(e)})
-            del pdf_bytes, pages, chunks, texts
             gc.collect()
-            continue
-
-        store.delete_chunks_for_file(f.id)
-        store.upsert_chunks(f.id, f.name, [(c.text, c.page) for c in chunks], vectors)
-        store.upsert_file_meta(f.id, f.name, f.modified_time)
-
-        _reindex_state["processed"].append({"file": f.name, "chunks": len(chunks)})
-        logger.info("Проиндексирован файл '%s': %d чанков", f.name, len(chunks))
-
-        # Free per-file memory before the next iteration -- Render's free
-        # tier caps this service at 512MB, and PDF bytes / chunk texts /
-        # vectors for a large file can add up to tens of MB that don't need
-        # to stick around once the file is upserted to Qdrant.
-        del pdf_bytes, pages, chunks, texts, vectors
-        gc.collect()
+        except Exception as e:
+            logger.exception("Неожиданная ошибка при обработке файла '%s'", f.name)
+            _reindex_state["errors"].append({"file": f.name, "error": f"{type(e).__name__}: {e}"})
+            gc.collect()
 
     _reindex_state["current_file"] = None
     _reindex_state["status"] = "done"
