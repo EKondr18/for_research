@@ -22,6 +22,7 @@ Trade-offs vs a local model:
 """
 import logging
 import time
+from typing import Callable
 
 import requests
 
@@ -29,7 +30,13 @@ logger = logging.getLogger("embeddings")
 
 HF_ROUTER_BASE = "https://router.huggingface.co/hf-inference/models"
 EMBEDDING_DIM = 384  # sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-_BATCH_SIZE = 16
+# Batching only matters for HTTP round-trip overhead now (there's no local
+# model/memory to protect since embeddings run on HF's infrastructure), so
+# this can be much larger than the 16 used when this batched a local ONNX
+# model call. Fewer, bigger requests means noticeably less total wall-clock
+# time for a large file's worth of chunks.
+_BATCH_SIZE = 64
+_REQUEST_TIMEOUT_S = 120
 _MAX_COLD_START_WAIT_S = 90
 
 
@@ -40,7 +47,7 @@ class EmbeddingAPIError(RuntimeError):
 def _post_with_cold_start_retry(url: str, headers: dict, payload: dict) -> requests.Response:
     deadline = time.monotonic() + _MAX_COLD_START_WAIT_S
     while True:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp = requests.post(url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT_S)
         if resp.status_code == 503:
             wait_s = 5.0
             try:
@@ -84,13 +91,22 @@ def _embed_batch(texts: list[str], model_name: str, hf_token: str) -> list[list[
     return [_pool_if_needed(item) for item in data]
 
 
-def embed_passages(texts: list[str], model_name: str, hf_token: str) -> list[list[float]]:
+def embed_passages(
+    texts: list[str],
+    model_name: str,
+    hf_token: str,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[list[float]]:
     if not texts:
         return []
+    total = len(texts)
     vectors: list[list[float]] = []
-    for i in range(0, len(texts), _BATCH_SIZE):
+    for i in range(0, total, _BATCH_SIZE):
         batch = texts[i : i + _BATCH_SIZE]
         vectors.extend(_embed_batch(batch, model_name, hf_token))
+        logger.info("Эмбеддинг: %d/%d чанков готово", len(vectors), total)
+        if on_progress:
+            on_progress(len(vectors), total)
     return vectors
 
 

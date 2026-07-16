@@ -156,6 +156,7 @@ def _run_reindex_body() -> None:
 
     for f in to_process:
         _reindex_state["current_file"] = f.name
+        _reindex_state["current_file_progress"] = None
         # Catch absolutely everything per-file (not just the errors we
         # anticipated) -- an unhandled exception here previously escaped
         # this loop entirely, crashing the background thread and leaving
@@ -176,7 +177,13 @@ def _run_reindex_body() -> None:
 
             chunks = chunk_pages(pages, settings.chunk_size, settings.chunk_overlap)
             texts = [c.text for c in chunks]
-            vectors = embed_passages(texts, settings.embedding_model, settings.hf_api_token)
+
+            def _on_progress(done: int, total: int) -> None:
+                _reindex_state["current_file_progress"] = {"chunks_done": done, "chunks_total": total}
+
+            vectors = embed_passages(
+                texts, settings.embedding_model, settings.hf_api_token, on_progress=_on_progress
+            )
 
             store.delete_chunks_for_file(f.id)
             store.upsert_chunks(f.id, f.name, [(c.text, c.page) for c in chunks], vectors)
