@@ -38,16 +38,23 @@ EMBEDDING_DIM = 384  # sentence-transformers/paraphrase-multilingual-MiniLM-L12-
 _BATCH_SIZE = 64
 _REQUEST_TIMEOUT_S = 120
 _MAX_COLD_START_WAIT_S = 90
+# Transient server-side errors (observed in practice: plain 500 Internal
+# Server Error from HF's shared free-tier infra, not tied to cold start)
+# get a few short retries before giving up on the whole batch.
+_MAX_TRANSIENT_RETRIES = 3
+_TRANSIENT_STATUS_CODES = {500, 502, 504}
 
 
 class EmbeddingAPIError(RuntimeError):
     pass
 
 
-def _post_with_cold_start_retry(url: str, headers: dict, payload: dict) -> requests.Response:
+def _post_with_retry(url: str, headers: dict, payload: dict) -> requests.Response:
     deadline = time.monotonic() + _MAX_COLD_START_WAIT_S
+    transient_attempts = 0
     while True:
         resp = requests.post(url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT_S)
+
         if resp.status_code == 503:
             wait_s = 5.0
             try:
@@ -59,6 +66,17 @@ def _post_with_cold_start_retry(url: str, headers: dict, payload: dict) -> reque
             logger.info("HF-модель ещё прогревается (cold start), жду %.0fs...", wait_s)
             time.sleep(wait_s)
             continue
+
+        if resp.status_code in _TRANSIENT_STATUS_CODES and transient_attempts < _MAX_TRANSIENT_RETRIES:
+            transient_attempts += 1
+            wait_s = 3.0 * transient_attempts
+            logger.warning(
+                "HF Inference API вернул временную ошибку %d, повтор %d/%d через %.0fs...",
+                resp.status_code, transient_attempts, _MAX_TRANSIENT_RETRIES, wait_s,
+            )
+            time.sleep(wait_s)
+            continue
+
         return resp
 
 
@@ -79,7 +97,7 @@ def _pool_if_needed(item: list) -> list[float]:
 def _embed_batch(texts: list[str], model_name: str, hf_token: str) -> list[list[float]]:
     url = f"{HF_ROUTER_BASE}/{model_name}/pipeline/feature-extraction"
     headers = {"Authorization": f"Bearer {hf_token}"}
-    resp = _post_with_cold_start_retry(url, headers, {"inputs": texts})
+    resp = _post_with_retry(url, headers, {"inputs": texts})
 
     if resp.status_code != 200:
         raise EmbeddingAPIError(
